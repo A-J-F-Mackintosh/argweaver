@@ -29,15 +29,40 @@ using namespace std;
 //=============================================================================
 // Forward algorithm for thread path
 
+// Mix the two read-backed phase layers of a forward column at a
+// heterozygous site of the individual being phased (see phase_thread.h).
+void mix_phase_layers(double *col_a, double *col_b, int nstates, char mix,
+                      double switch_prob)
+{
+    if (mix == PHASE_MIX_SWITCH) {
+        for (int k=0; k<nstates; k++) {
+            double a = col_a[k], b = col_b[k];
+            col_a[k] = (1.0 - switch_prob) * a + switch_prob * b;
+            col_b[k] = switch_prob * a + (1.0 - switch_prob) * b;
+        }
+    } else if (mix == PHASE_MIX_REDRAW) {
+        for (int k=0; k<nstates; k++)
+            col_a[k] = col_b[k] = 0.5 * (col_a[k] + col_b[k]);
+    }
+}
+
+
 // compute one block of forward algorithm with compressed transition matrices
 // NOTE: first column of forward table should be pre-populated
+//
+// If fw2 is given, the state space is doubled by a read-backed phase state:
+// fw/emit are the forward table and emissions for phase state "1-1", and
+// fw2/emit2 for "1-2".  mix[i] says how the phase state changes at column i.
 void arghmm_forward_block(const ArgModel *model,
                           const LocalTree *tree,
                           const int blocklen, const States &states,
                           const LineageCounts &lineages,
                           const TransMatrix *matrix,
-                          const double* const *emit, double **fw)
+                          const double* const *emit, double **fw,
+                          double **fw2, const double* const *emit2,
+                          const char *mix, double switch_prob)
 {
+    const int nlayers = (fw2 == NULL) ? 1 : 2;
     const int nstates = states.size();
     const LocalNode *nodes = tree->nodes;
     const int ntimes = model->ntimes;
@@ -50,8 +75,16 @@ void arghmm_forward_block(const ArgModel *model,
 
         if (nstates == 0) {
             // handle fully given case
-            for (int i=1; i<blocklen; i++)
+            for (int i=1; i<blocklen; i++) {
                 fw[i][0] = fw[i-1][0];
+                if (fw2) {
+                    fw2[i][0] = fw2[i-1][0];
+                    mix_phase_layers(fw[i], fw2[i], 1, mix[i], switch_prob);
+                    double norm = fw[i][0] + fw2[i][0];
+                    fw[i][0] /= norm;
+                    fw2[i][0] /= norm;
+                }
+            }
             return;
         }
     }
@@ -221,62 +254,77 @@ void arghmm_forward_block(const ArgModel *model,
     double tmatrix_fgroups[max_numpath][ntimes];
     double fgroups[max_numpath][ntimes];
     for (int i=1; i<blocklen; i++) {
-        const double *col1 = fw[i-1];
-        double *col2 = fw[i];
-        const double *emit2 = emit[i];
-        idx = 0;
+        // apply the thread transitions to each phase layer
+        for (int layer=0; layer<nlayers; layer++) {
+            const double *col1 = (layer == 0) ? fw[i-1] : fw2[i-1];
+            double *col2 = (layer == 0) ? fw[i] : fw2[i];
+            idx = 0;
 
-        // precompute the fgroup sums
-        for (int p=0; p < max_numpath; p++)
-            fill(fgroups[p], fgroups[p]+ntimes, 0.0);
-        for (int j=0; j<nstates; j++) {
-            const int a = states[j].time;
-            fgroups[path_map[j]][a] += col1[j];
-            assert(!isinf(col1[j]));
-        }
+            // precompute the fgroup sums
+            for (int p=0; p < max_numpath; p++)
+                fill(fgroups[p], fgroups[p]+ntimes, 0.0);
+            for (int j=0; j<nstates; j++) {
+                const int a = states[j].time;
+                fgroups[path_map[j]][a] += col1[j];
+                assert(!isinf(col1[j]));
+            }
 
-        // multiply tmatrix and fgroups together
-        for (int b=0; b<ntimes-1; b++) {
-            for (int pb=0; pb < numpath_per_time[b]; pb++) {
-                double sum = 0.0;
-                for (int a=0; a<ntimes-1; a++) {
-                    for (int pa=0; pa < numpath_per_time[a]; pa++) {
-                        sum += tmatrix[b][pb][a][pa] * fgroups[pa][a];
+            // multiply tmatrix and fgroups together
+            for (int b=0; b<ntimes-1; b++) {
+                for (int pb=0; pb < numpath_per_time[b]; pb++) {
+                    double sum = 0.0;
+                    for (int a=0; a<ntimes-1; a++) {
+                        for (int pa=0; pa < numpath_per_time[a]; pa++) {
+                            sum += tmatrix[b][pb][a][pa] * fgroups[pa][a];
+                        }
                     }
-                }
-                tmatrix_fgroups[pb][b] = sum;
-            }
-        }
-
-        // fill in one column of forward table
-        double norm = 0.0;
-        for (int k=0; k<nstates; k++) {
-            const int b = states[k].time;
-            const int node2 = states[k].node;
-            const int age2 = ages2[node2];
-            double sum = tmatrix_fgroups[path_map[k]][b];
-
-            // same branch case
-            for (int a=age1_state[k]; a <= age2; a++) {
-                int j_state = nextState[idx++];
-                if (j_state >= 0 && col1[j_state] > 0) {
-                    sum += tmatrix2[k][a] * col1[j_state];
+                    tmatrix_fgroups[pb][b] = sum;
                 }
             }
-            // this setion accounts for self-recombinations that change paths
-            // (same node, same time, different path)
-            if (max_numpath > 1) {
-                for (int pa=0; pa < numpath_per_time[b]; pa++) {
+
+            // fill in one column of forward table (before emissions)
+            for (int k=0; k<nstates; k++) {
+                const int b = states[k].time;
+                const int node2 = states[k].node;
+                const int age2 = ages2[node2];
+                double sum = tmatrix_fgroups[path_map[k]][b];
+
+                // same branch case
+                for (int a=age1_state[k]; a <= age2; a++) {
                     int j_state = nextState[idx++];
                     if (j_state >= 0 && col1[j_state] > 0) {
-                        sum += tmatrix3[k][pa] * col1[j_state];
+                        sum += tmatrix2[k][a] * col1[j_state];
                     }
                 }
+                // this setion accounts for self-recombinations that change paths
+                // (same node, same time, different path)
+                if (max_numpath > 1) {
+                    for (int pa=0; pa < numpath_per_time[b]; pa++) {
+                        int j_state = nextState[idx++];
+                        if (j_state >= 0 && col1[j_state] > 0) {
+                            sum += tmatrix3[k][pa] * col1[j_state];
+                        }
+                    }
+                }
+                col2[k] = sum;
             }
-            col2[k] = sum * emit2[k];
-            norm += col2[k];
-            if (isnan(col2[k]))
-                assert(false);
+        }
+
+        // change of read-backed phase state
+        if (nlayers == 2)
+            mix_phase_layers(fw[i], fw2[i], nstates, mix[i], switch_prob);
+
+        // apply emissions
+        double norm = 0.0;
+        for (int layer=0; layer<nlayers; layer++) {
+            double *col2 = (layer == 0) ? fw[i] : fw2[i];
+            const double *emit_col = (layer == 0) ? emit[i] : emit2[i];
+            for (int k=0; k<nstates; k++) {
+                col2[k] *= emit_col[k];
+                norm += col2[k];
+                if (isnan(col2[k]))
+                    assert(false);
+            }
         }
         assert(norm > 0);
         assert(!isnan(norm));
@@ -284,8 +332,10 @@ void arghmm_forward_block(const ArgModel *model,
 
         // normalize column for numerical stability
         for (int k=0; k<nstates; k++)
-            col2[k] /= norm;
-
+            fw[i][k] /= norm;
+        if (nlayers == 2)
+            for (int k=0; k<nstates; k++)
+                fw2[i][k] /= norm;
     }
 }
 
@@ -339,11 +389,9 @@ void arghmm_forward_block_slow(const LocalTree *tree, const int ntimes,
 
 
 
-// run forward algorithm for one column of the table
-// use switch matrix
-void arghmm_forward_switch(const double *col1, double* col2,
-                           const TransMatrixSwitch *matrix,
-                           const double *emit)
+// apply the switch matrix transitions to one column (no emissions)
+void arghmm_forward_switch_trans(const double *col1, double* col2,
+                                 const TransMatrixSwitch *matrix)
 {
     // if state space is size zero, we still treat it as size 1
     const int nstates1 = max(matrix->nstates1, 1);
@@ -390,6 +438,18 @@ void arghmm_forward_switch(const double *col1, double* col2,
             }
         }
     }
+}
+
+
+// run forward algorithm for one column of the table
+// use switch matrix
+void arghmm_forward_switch(const double *col1, double* col2,
+                           const TransMatrixSwitch *matrix,
+                           const double *emit)
+{
+    const int nstates2 = max(matrix->nstates2, 1);
+    arghmm_forward_switch_trans(col1, col2, matrix);
+
     double norm = 0.0;
     for (int k=0; k<nstates2; k++) {
         col2[k] *= emit[k];

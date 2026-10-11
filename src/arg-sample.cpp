@@ -21,6 +21,9 @@
 #include "argweaver/track.h"
 #include "argweaver/est_popsize.h"
 #include "argweaver/mcmcmc.h"
+#include "argweaver/phase_hmm.h"
+#include "argweaver/phase_flip.h"
+#include "argweaver/phase_thread.h"
 #include "argweaver/coal_records.h"
 #include "argweaver/recomb.h"
 
@@ -176,6 +179,52 @@ public:
                     " is to sample at same frequency as ARGs (see --sample-step),"
                     " unless --no-sample-phase is given",
                     ADVANCED_OPT));
+        config.add(new ConfigParam<string>
+                   ("", "--phase-blocks", "<phase file>", &phase_blocks_file,
+                    "", "read-backed phase blocks (e.g. from WhatsHap) for"
+                    " each individual. Phase is then resampled respecting"
+                    " these blocks. The file follows the sites format, with"
+                    " comma-separated block ids ('.' if unknown) instead of"
+                    " bases, and individuals <ind> named in NAMES, whose"
+                    " haplotypes are <ind>_1 and <ind>_2"));
+        config.add(new ConfigParam<double>
+                   ("", "--phase-switch-prob", "<s>", &phase_switch_prob,
+                    0.01, "with read-backed phase blocks: probability of a"
+                    " switch error between neighbouring heterozygous sites"
+                    " in the same block (default=0.01)"));
+        config.add(new ConfigParam<double>
+                   ("", "--phase-point-error-prob", "<e>",
+                    &phase_point_prob, -1.0, "with read-backed phase"
+                    " blocks: probability that a single heterozygous site"
+                    " in a block has its alleles the other way round, without"
+                    " a switch of the block's phase (default: the same as"
+                    " --phase-switch-prob)"));
+        config.add(new ConfigParam<int>
+                   ("", "--phase-flip-margin", "<bp>", &phase_flip_margin,
+                    500, "with read-backed phase blocks: flip moves re-thread"
+                    " a window around each boundary between blocks, extending"
+                    " this far beyond the two heterozygous sites either side"
+                    " of it (default=500)"));
+        config.add(new ConfigParam<int>
+                   ("", "--phase-flip-burnin", "<niters>", &phase_flip_burnin,
+                    1000, "with read-backed phase blocks: number of burn-in"
+                    " iterations, during which flip moves are made more often"
+                    " (default=1000)"));
+        config.add(new ConfigParam<double>
+                   ("", "--phase-flip-freq-burnin", "<p>",
+                    &phase_flip_freq_burnin, 1.0/3.0,
+                    "with read-backed phase blocks: fraction of iterations"
+                    " that are flip moves during burn-in (default=1/3)"));
+        config.add(new ConfigParam<double>
+                   ("", "--phase-flip-freq", "<p>", &phase_flip_freq, 0.1,
+                    "with read-backed phase blocks: fraction of iterations"
+                    " that are flip moves after burn-in (default=0.1).  A"
+                    " flip move tries flipping the relative phase at every"
+                    " boundary between blocks of one individual, then"
+                    " resamples every individual's phase given the ARG.  The"
+                    " other iterations are split evenly between re-threading"
+                    " a haplotype jointly with its phase and ARGweaver's"
+                    " internal moves"));
 
         config.add(new ConfigParamComment("Masking options"));
 	config.add(new ConfigParam<string>
@@ -649,6 +698,14 @@ public:
     double switch_error_rate;
     bool no_sample_phase;
     int sample_phase_step;
+    string phase_blocks_file;
+    double phase_switch_prob;
+    double phase_point_prob;
+    int phase_flip_margin;
+    int phase_flip_burnin;
+    double phase_flip_freq_burnin;
+    double phase_flip_freq;
+    vector<PhaseBlocks> phase_blocks;
     bool all_masked;
     bool write_sites;
     bool write_sites_only;
@@ -1142,6 +1199,68 @@ void mcmcmc_swap(Config *config, ArgModel *model, const Sequences *sequences,
 }
 
 
+// One iteration with read-backed phase blocks.  Choose one of three moves:
+//   - flip: try flipping the relative phase at each boundary between blocks
+//     of one individual, then resample every individual's phase given the
+//     ARG (a fraction of iterations set by --phase-flip-freq-burnin during
+//     burn-in and --phase-flip-freq after);
+//   - re-thread a haplotype jointly with its individual's phase;
+//   - ARGweaver's internal moves.
+// The last two share the remaining iterations evenly.
+void resample_arg_phase_blocks(ArgModel *model, Sequences *sequences,
+                               LocalTrees *trees, Config *config, int iter,
+                               int window, int niters, double heat)
+{
+    const vector<PhaseBlocks> &all_blocks = config->phase_blocks;
+    const double flip_freq = (iter < config->phase_flip_burnin) ?
+        config->phase_flip_freq_burnin : config->phase_flip_freq;
+
+    if (frand() < flip_freq) {
+        const PhaseBlocks &blocks = all_blocks[irand(all_blocks.size())];
+        int ntried;
+        int naccept = flip_phase_boundaries(
+            model, sequences, trees, blocks, config->phase_flip_margin,
+            &ntried);
+        printLog(LOG_LOW, "flip_phase_boundaries %s %s: %d of %d flips"
+                 " accepted\n", sequences->names[blocks.hap1].c_str(),
+                 sequences->names[blocks.hap2].c_str(), naccept, ntried);
+
+        for (unsigned int j=0; j<all_blocks.size(); j++) {
+            const PhaseBlocks &blocks = all_blocks[j];
+            int nswapped = resample_phase(
+                model, sequences, trees, blocks, config->phase_switch_prob,
+                config->phase_point_prob);
+            printLog(LOG_LOW, "resample_phase %s %s: %d of %d sites"
+                     " swapped\n", sequences->names[blocks.hap1].c_str(),
+                     sequences->names[blocks.hap2].c_str(), nswapped,
+                     blocks.size());
+        }
+    } else if (irand(2) == 0) {
+        int node = irand(trees->get_num_leaves());
+        int seqid = trees->seqids[node];
+        const PhaseBlocks *blocks = NULL;
+        for (unsigned int j=0; j<all_blocks.size(); j++)
+            if (all_blocks[j].hap1 == seqid || all_blocks[j].hap2 == seqid)
+                blocks = &all_blocks[j];
+        if (blocks) {
+            int nswapped = resample_arg_leaf_phase(
+                model, sequences, trees, node, *blocks,
+                config->phase_switch_prob, config->phase_point_prob);
+            printLog(LOG_LOW, "resample_arg_leaf_phase %s: %d of %d sites"
+                     " swapped\n", sequences->names[seqid].c_str(),
+                     nswapped, blocks->size());
+        } else {
+            // a haplotype without a partner
+            resample_arg_leaf(model, sequences, trees, node);
+            printLog(LOG_LOW, "resample_arg_leaf: accept=%f\n", 1.0);
+        }
+    } else {
+        resample_arg_mcmc_all(model, sequences, trees, false, window, niters,
+                              heat, config->no_resample_mig);
+    }
+}
+
+
 void resample_arg_all(ArgModel *model, Sequences *sequences, LocalTrees *trees,
                       SitesMapping* sites_mapping, Config *config,
                       const TrackNullValue *maskmap_orig)
@@ -1198,7 +1317,10 @@ void resample_arg_all(ArgModel *model, Sequences *sequences, LocalTrees *trees,
         do_leaf[i] = ( frand() < frac_leaf );
 #endif
 
-	if ( ! config->no_sample_arg) {
+	if (config->phase_blocks.size() > 0) {
+            resample_arg_phase_blocks(model, sequences, trees, config, i,
+                                      window, niters, heat);
+        } else if ( ! config->no_sample_arg) {
 	    if (config->gibbs)
 		resample_arg(model, sequences, trees);
 	    else
@@ -1916,6 +2038,43 @@ int main(int argc, char **argv)
         c.sample_phase_step=0;
     else if (c.sample_phase_step == 0)
         c.sample_phase_step = c.sample_step;
+
+    // setup read-backed phase blocks
+    if (c.phase_blocks_file != "") {
+        bool mcmcmc = false;
+#ifdef ARGWEAVER_MPI
+        mcmcmc = (c.mcmcmc_numgroup > 1);
+#endif
+        if (c.gibbs || c.no_sample_arg || mcmcmc || c.infsites ||
+            sequences.base_probs.size() > 0) {
+            printError("read-backed phase blocks cannot yet be used with"
+                       " --gibbs, --no-sample-arg, --mcmcmc, --infsites or"
+                       " genotype probabilities");
+            return EXIT_ERROR;
+        }
+        if (c.phase_point_prob < 0.0)
+            c.phase_point_prob = c.phase_switch_prob;
+        if (c.phase_point_prob > 0.5) {
+            printError("--phase-point-error-prob must be at most 0.5");
+            return EXIT_ERROR;
+        }
+        // threading treats the current phase as fixed (this overrides
+        // --unphased); phase is only changed by the phase block moves
+        c.model.unphased = false;
+        if (!read_phase_blocks(c.phase_blocks_file.c_str(), &sequences,
+                               sites_mapping, c.phase_blocks))
+            return EXIT_ERROR;
+        // record the diploid pairs given by the phase blocks
+        sequences.pairs.assign(sequences.get_num_seqs(), -1);
+        for (unsigned int j=0; j<c.phase_blocks.size(); j++) {
+            sequences.pairs[c.phase_blocks[j].hap1] = c.phase_blocks[j].hap2;
+            sequences.pairs[c.phase_blocks[j].hap2] = c.phase_blocks[j].hap1;
+        }
+        printLog(LOG_LOW, "read-backed phase blocks for %d individuals,"
+                 " switch probability %g, point error probability %g\n",
+                 (int) c.phase_blocks.size(), c.phase_switch_prob,
+                 c.phase_point_prob);
+    }
 
     if (c.sample_popsize_num > 0) {
 	if (c.popsize_em) {

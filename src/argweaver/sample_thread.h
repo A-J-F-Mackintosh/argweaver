@@ -127,6 +127,28 @@ public:
 //=============================================================================
 // Forward algorithm for thread path
 
+// how the read-backed phase state changes at a column (see phase_thread.h)
+enum {
+    PHASE_MIX_NONE = 0,    // no change
+    PHASE_MIX_SWITCH = 1,  // keep with 1-s, switch with s
+    PHASE_MIX_REDRAW = 2   // draw afresh, 50/50
+};
+
+void arghmm_forward_block(const ArgModel *model,
+                          const LocalTree *tree,
+                          const int blocklen, const States &states,
+                          const LineageCounts &lineages,
+                          const TransMatrix *matrix,
+                          const double* const *emit, double **fw,
+                          double **fw2=NULL, const double* const *emit2=NULL,
+                          const char *mix=NULL, double switch_prob=0.0);
+
+void mix_phase_layers(double *col_a, double *col_b, int nstates, char mix,
+                      double switch_prob);
+
+void arghmm_forward_switch_trans(const double *col1, double* col2,
+                                 const TransMatrixSwitch *matrix);
+
 void arghmm_forward_alg(const LocalTrees *trees, const ArgModel *model,
     const Sequences *sequences, ArgHmmMatrixIter *matrix_iter,
     ArgHmmForwardTable *forward, PhaseProbs *phase_pr=NULL,
