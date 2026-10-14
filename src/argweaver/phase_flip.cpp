@@ -734,11 +734,13 @@ bool rebuild_leaf_thread(const ArgModel *model, const Sequences *sequences,
 
 int flip_phase_boundaries(const ArgModel *model, Sequences *sequences,
                           LocalTrees *trees, const PhaseBlocks &blocks,
-                          int margin, int *ntried)
+                          int margin, int *ntried, double try_prob)
 {
     int naccept = 0, ntry = 0;
     for (int k=1; k<blocks.size(); k++) {
         if (blocks.same_block(k))
+            continue;
+        if (try_prob < 1.0 && frand() >= try_prob)
             continue;
         ntry++;
         if (flip_phase_boundary(model, sequences, trees, blocks, k, margin))

@@ -61,12 +61,13 @@ bool flip_phase_boundary(const ArgModel *model, Sequences *sequences,
                          int margin, FlipMoveInfo *info=NULL,
                          int first=-1);
 
-// Propose a flip at every boundary between blocks, in turn, accepting or
-// rejecting each one separately.  Returns the number accepted, and gives
-// the number tried.
+// Visit every boundary between blocks in turn and, with probability
+// 'try_prob' each, propose a flip there, accepting or rejecting each one
+// separately.  Returns the number accepted, and gives the number tried.
 int flip_phase_boundaries(const ArgModel *model, Sequences *sequences,
                           LocalTrees *trees, const PhaseBlocks &blocks,
-                          int margin, int *ntried=NULL);
+                          int margin, int *ntried=NULL,
+                          double try_prob=1.0);
 
 // For testing: remove leaf 'seqid' from 'full', read its thread off 'full'
 // and add it back.  'rebuilt' should then equal 'full'.  Returns false if

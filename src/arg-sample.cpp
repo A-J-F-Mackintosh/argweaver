@@ -212,19 +212,31 @@ public:
                     " (default=1000)"));
         config.add(new ConfigParam<double>
                    ("", "--phase-flip-freq-burnin", "<p>",
-                    &phase_flip_freq_burnin, 1.0/3.0,
+                    &phase_flip_freq_burnin, 0.33,
                     "with read-backed phase blocks: fraction of iterations"
-                    " that are flip moves during burn-in (default=1/3)"));
+                    " that are flip moves during burn-in (default=0.33)"));
         config.add(new ConfigParam<double>
-                   ("", "--phase-flip-freq", "<p>", &phase_flip_freq, 0.1,
+                   ("", "--phase-flip-freq", "<p>", &phase_flip_freq, 0.33,
                     "with read-backed phase blocks: fraction of iterations"
-                    " that are flip moves after burn-in (default=0.1).  A"
-                    " flip move tries flipping the relative phase at every"
-                    " boundary between blocks of one individual, then"
-                    " resamples every individual's phase given the ARG.  The"
-                    " other iterations are split evenly between re-threading"
-                    " a haplotype jointly with its phase and ARGweaver's"
+                    " that are flip moves after burn-in (default=0.33).  A"
+                    " flip move visits every boundary between blocks of one"
+                    " individual and tries flipping the relative phase at"
+                    " each with the probability below, then resamples every"
+                    " individual's phase given the ARG.  The other"
+                    " iterations are split evenly between re-threading a"
+                    " haplotype jointly with its phase and ARGweaver's"
                     " internal moves"));
+        config.add(new ConfigParam<double>
+                   ("", "--phase-flip-sample-burnin", "<p>",
+                    &phase_flip_sample_burnin, 0.1,
+                    "with read-backed phase blocks: probability that a flip"
+                    " move tries each boundary it visits, during burn-in"
+                    " (default=0.1)"));
+        config.add(new ConfigParam<double>
+                   ("", "--phase-flip-sample", "<p>", &phase_flip_sample,
+                    0.1, "with read-backed phase blocks: probability that a"
+                    " flip move tries each boundary it visits, after burn-in"
+                    " (default=0.1)"));
 
         config.add(new ConfigParamComment("Masking options"));
 	config.add(new ConfigParam<string>
@@ -705,6 +717,8 @@ public:
     int phase_flip_burnin;
     double phase_flip_freq_burnin;
     double phase_flip_freq;
+    double phase_flip_sample_burnin;
+    double phase_flip_sample;
     vector<PhaseBlocks> phase_blocks;
     bool all_masked;
     bool write_sites;
@@ -1201,9 +1215,10 @@ void mcmcmc_swap(Config *config, ArgModel *model, const Sequences *sequences,
 
 // One iteration with read-backed phase blocks.  Choose one of three moves:
 //   - flip: try flipping the relative phase at each boundary between blocks
-//     of one individual, then resample every individual's phase given the
-//     ARG (a fraction of iterations set by --phase-flip-freq-burnin during
-//     burn-in and --phase-flip-freq after);
+//     of one individual, each with probability --phase-flip-sample-burnin
+//     during burn-in and --phase-flip-sample after, then resample every
+//     individual's phase given the ARG (a fraction of iterations set by
+//     --phase-flip-freq-burnin during burn-in and --phase-flip-freq after);
 //   - re-thread a haplotype jointly with its individual's phase;
 //   - ARGweaver's internal moves.
 // The last two share the remaining iterations evenly.
@@ -1212,17 +1227,20 @@ void resample_arg_phase_blocks(ArgModel *model, Sequences *sequences,
                                int window, int niters, double heat)
 {
     const vector<PhaseBlocks> &all_blocks = config->phase_blocks;
-    const double flip_freq = (iter < config->phase_flip_burnin) ?
+    const bool burnin = (iter < config->phase_flip_burnin);
+    const double flip_freq = burnin ?
         config->phase_flip_freq_burnin : config->phase_flip_freq;
+    const double flip_sample = burnin ?
+        config->phase_flip_sample_burnin : config->phase_flip_sample;
 
     if (frand() < flip_freq) {
         const PhaseBlocks &blocks = all_blocks[irand(all_blocks.size())];
         int ntried;
         int naccept = flip_phase_boundaries(
             model, sequences, trees, blocks, config->phase_flip_margin,
-            &ntried);
-        printLog(LOG_LOW, "flip_phase_boundaries %s %s: %d of %d flips"
-                 " accepted\n", sequences->names[blocks.hap1].c_str(),
+            &ntried, flip_sample);
+        printLog(LOG_LOW, "flip_phase_boundaries %s %s: %d of %d attempted"
+                 " flips accepted\n", sequences->names[blocks.hap1].c_str(),
                  sequences->names[blocks.hap2].c_str(), naccept, ntried);
 
         for (unsigned int j=0; j<all_blocks.size(); j++) {
@@ -2056,6 +2074,13 @@ int main(int argc, char **argv)
             c.phase_point_prob = c.phase_switch_prob;
         if (c.phase_point_prob > 0.5) {
             printError("--phase-point-error-prob must be at most 0.5");
+            return EXIT_ERROR;
+        }
+        if (c.phase_flip_sample_burnin <= 0.0 ||
+            c.phase_flip_sample_burnin > 1.0 ||
+            c.phase_flip_sample <= 0.0 || c.phase_flip_sample > 1.0) {
+            printError("--phase-flip-sample-burnin and --phase-flip-sample"
+                       " must be in (0, 1]");
             return EXIT_ERROR;
         }
         // threading treats the current phase as fixed (this overrides
